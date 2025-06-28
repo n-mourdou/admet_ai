@@ -1,5 +1,6 @@
 """ADMET-AI class to contain ADMET model and prediction function."""
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import Pool
 from pathlib import Path
 
@@ -44,6 +45,8 @@ class ADMETModel:
         num_workers: int | None = None,
         cache_molecules: bool = True,
         fingerprint_multiprocessing_min: int = 100,
+        max_model_workers: int | None = None,
+        max_ensemble_workers: int | None = None,
     ) -> None:
         """Initialize the ADMET-AI model.
 
@@ -60,6 +63,12 @@ class ADMETModel:
         :param cache_molecules: Whether to cache molecules. Caching improves prediction speed but requires more memory.
         :param fingerprint_multiprocessing_min: Minimum number of molecules for multiprocessing to be used for
                                                 fingerprint computation. Otherwise, single processing is used.
+        :param max_model_workers: Maximum number of workers for parallel model execution within each ensemble.
+                                  If None, defaults to min(4, number of models in ensemble) for CPU or 1 for GPU
+                                  to avoid GPU memory issues.
+        :param max_ensemble_workers: Maximum number of workers for parallel ensemble execution.
+                                     If None, defaults to min(2, number of ensembles) for CPU or 1 for GPU
+                                     to avoid GPU memory issues.
         """
         # Check parameters
         if atc_code is not None and drugbank_path is None:
@@ -71,11 +80,23 @@ class ADMETModel:
         if num_workers is None:
             num_workers = 8 if torch.cuda.is_available() else 0
 
+        # Set default max_model_workers based on device
+        if max_model_workers is None:
+            # For GPU, use 1 worker to avoid memory issues; for CPU, use up to 4 workers
+            max_model_workers = 1 if torch.cuda.is_available() else 4
+
+        # Set default max_ensemble_workers based on device
+        if max_ensemble_workers is None:
+            # For GPU, use 1 worker to avoid memory issues; for CPU, use up to 2 workers
+            max_ensemble_workers = 1 if torch.cuda.is_available() else 2
+
         # Save parameters
         self.include_physchem = include_physchem
         self.num_workers = num_workers
         self.cache_molecules = cache_molecules
         self.fingerprint_multiprocessing_min = fingerprint_multiprocessing_min
+        self.max_model_workers = max_model_workers
+        self.max_ensemble_workers = max_ensemble_workers
         self._atc_code = atc_code
 
         # Load DrugBank reference set if needed
@@ -285,36 +306,50 @@ class ADMETModel:
         # Make predictions
         task_to_preds = {}
 
-        # Loop through each ensemble and make predictions
-        for tasks, use_features, models, scalers in tqdm(
-            zip(
-                self.task_lists,
-                self.use_features_list,
-                self.model_lists,
-                self.scaler_lists,
-            ),
-            total=self.num_ensembles,
-            desc="model ensembles",
-        ):
-            # Make predictions
-            preds = [
-                predict(model=model, data_loader=data_loader)
-                for model in tqdm(models, desc="individual models")
-            ]
-
-            # Scale predictions if needed (for regression)
-            if scalers[0] is not None:
-                preds = [
-                    scaler.inverse_transform(pred).astype(float)
-                    for scaler, pred in zip(scalers, preds)
-                ]
-
-            # Average ensemble predictions
-            preds = np.mean(preds, axis=0)
-
-            # Add predictions to data
-            for i, task in enumerate(tasks):
-                task_to_preds[task] = preds[:, i]
+        # Execute ensembles in parallel if multiple workers are available
+        if self.max_ensemble_workers > 1 and self.num_ensembles > 1:
+            # Use ThreadPoolExecutor for parallel ensemble execution
+            max_workers = min(self.max_ensemble_workers, self.num_ensembles)
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all ensemble prediction tasks
+                future_to_ensemble = {
+                    executor.submit(
+                        self._predict_single_ensemble, 
+                        tasks, models, scalers, data_loader
+                    ): i
+                    for i, (tasks, use_features, models, scalers) in enumerate(
+                        zip(
+                            self.task_lists,
+                            self.use_features_list,
+                            self.model_lists,
+                            self.scaler_lists,
+                        )
+                    )
+                }
+                
+                # Collect results from all ensembles
+                for future in tqdm(as_completed(future_to_ensemble), 
+                                 total=self.num_ensembles, 
+                                 desc="parallel ensembles"):
+                    ensemble_task_to_preds = future.result()
+                    task_to_preds.update(ensemble_task_to_preds)
+        else:
+            # Sequential execution (original approach)
+            for tasks, use_features, models, scalers in tqdm(
+                zip(
+                    self.task_lists,
+                    self.use_features_list,
+                    self.model_lists,
+                    self.scaler_lists,
+                ),
+                total=self.num_ensembles,
+                desc="model ensembles",
+            ):
+                ensemble_task_to_preds = self._predict_single_ensemble(
+                    tasks, models, scalers, data_loader
+                )
+                task_to_preds.update(ensemble_task_to_preds)
 
         # Put preds in a DataFrame
         admet_preds = pd.DataFrame(task_to_preds, index=smiles)
@@ -350,3 +385,60 @@ class ADMETModel:
             preds = preds.iloc[0].to_dict()
 
         return preds
+
+    def _predict_single_ensemble(
+        self, 
+        tasks: list[str], 
+        models: list[MoleculeModel], 
+        scalers: list[StandardScaler | None], 
+        data_loader: MoleculeDataLoader
+    ) -> dict[str, np.ndarray]:
+        """Make predictions for a single ensemble.
+
+        :param tasks: List of task names for this ensemble.
+        :param models: List of models in the ensemble.
+        :param scalers: List of scalers for the models.
+        :param data_loader: Data loader for the molecules.
+        :return: Dictionary mapping task names to prediction arrays.
+        """
+        # Make predictions in parallel if multiple workers are available
+        if self.max_model_workers > 1 and len(models) > 1:
+            # Use ThreadPoolExecutor for parallel model predictions
+            # Thread-based parallelism works well for I/O bound operations and GPU computations
+            max_workers = min(self.max_model_workers, len(models))
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all model prediction tasks
+                future_to_model = {
+                    executor.submit(predict, model=model, data_loader=data_loader): i
+                    for i, model in enumerate(models)
+                }
+                
+                # Collect results in order
+                preds = [None] * len(models)
+                for future in as_completed(future_to_model):
+                    model_idx = future_to_model[future]
+                    preds[model_idx] = future.result()
+        else:
+            # Sequential execution (original approach)
+            preds = [
+                predict(model=model, data_loader=data_loader)
+                for model in models
+            ]
+
+        # Scale predictions if needed (for regression)
+        if scalers[0] is not None:
+            preds = [
+                scaler.inverse_transform(pred).astype(float)
+                for scaler, pred in zip(scalers, preds)
+            ]
+
+        # Average ensemble predictions
+        preds = np.mean(preds, axis=0)
+
+        # Create task to predictions mapping
+        task_to_preds = {}
+        for i, task in enumerate(tasks):
+            task_to_preds[task] = preds[:, i]
+
+        return task_to_preds
